@@ -1,0 +1,415 @@
+:showtitle:
+:icons: font
+
+= Task cancellation failure mode
+
+This repo contains a relatively simple program demonstrating a particular failure mode resulting from cancel-unsafe code.
+
+The program here is basically just an HTTP server sitting in front of a PostgreSQL/CockroachDB database.  The HTTP server exposes endpoints for fetching and bumping a counter that's stored in the database:
+
+* `POST /reset`: deletes the existing database table (if any) and creates the table anew with an initial counter value of `1`
+* `GET /counter`: fetches the current value of the counter in the database
+* `POST /bump`: bumps the current value of the counter in the database
+* `GET /sleep`: opens a database transaction and then goes to sleep for 5 seconds
+
+== Prerequisites
+
+The program assumes it can start an HTTP server on 127.0.0.1 port 12344.
+
+The program assumes that a PostgreSQL-compatible database is already running with a database called "defaultdb" and that it can be accessed without authentication using the URL `postgresql://root@127.0.0.1:12345/defaultdb?sslmode=disable`.  If you're working on https://github.com/oxidecomputer/omicron[Omicron], you can start a temporary database instance using `cargo run --bin=omicron-dev db-run --listen-port=12345 --no-populate` (or just `omicron-dev db-run --listen-port-12345 --no-populate`).
+
+The program logs in https://github.com/trentm/node-bunyan[bunyan] format to stdout.  You can use the standard `bunyan` tool to view the log.  In the examples below I use https://github.com/oxidecomputer/looker[`looker`] instead.
+
+The program links to libpq, so you have to have that installed.  See https://github.com/oxidecomputer/omicron/blob/main/docs/how-to-run-simulated.adoc#installing-prerequisites["Installing Prerequisites"] in the Omicron documentation.  The build process for this program does not provide the runtime linker flags required to set RPATH in the generated binary to point to libpq.  On your system, you may need to specify LD_LIBRARY_PATH.
+
+To make the output more readable, I set the prompt with `export PS1='\n$ '`.
+
+== Basic usage
+
+Let's show how this works first.  I've got the database started as shown above.  Now I'll start this program:
+
+[source,text]
+----
+$ LD_LIBRARY_PATH=/opt/ooce/pgsql-13/lib/amd64 cargo run | looker
+note: configured to log to "/dev/stdout"
+00:03:50.124Z INFO cancel-repro: setting up dropshot server
+00:03:50.124Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = POST
+    path = /bump
+00:03:50.124Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = GET
+    path = /counter
+00:03:50.124Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = POST
+    path = /reset
+00:03:50.124Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = GET
+    path = /sleep
+00:03:50.124Z INFO cancel-repro: listening
+    local_addr = 127.0.0.1:12344
+00:03:50.124Z DEBG cancel-repro: DTrace USDT probes compiled out, not registering
+    local_addr = 127.0.0.1:12344
+00:03:50.124Z INFO cancel-repro: set up dropshot server
+    local_address = 127.0.0.1:12344
+----
+
+First, let's fetch the counter value:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 500 Internal Server Error
+content-type: application/json
+x-request-id: 07bb02a2-cbdb-48ce-b910-89c0adc09cbd
+content-length: 283
+date: Thu, 22 Jun 2023 00:06:04 GMT
+
+{
+  "request_id": "07bb02a2-cbdb-48ce-b910-89c0adc09cbd",
+  "message": "loading counter: Failure accessing a connection: Failed to issue a query: relation \"counter\" does not exist: Failed to issue a query: relation \"counter\" does not exist: relation \"counter\" does not exist"
+}
+----
+
+Oops!  We forgot to initialize the database.  Let's do that:
+
+[source,text]
+----
+curl -i http://127.0.0.1:12344/reset -X POST
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 736e6470-5753-4236-9df6-5f6a6a037459
+content-length: 4
+date: Thu, 22 Jun 2023 00:06:37 GMT
+
+"ok"
+----
+
+Now fetch the counter:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 115cfe48-3e3c-4043-bf24-c0600c45ab02
+content-length: 1
+date: Thu, 22 Jun 2023 00:06:49 GMT
+
+1
+----
+
+Let's be sure:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 77bc4855-98f5-46a1-9c9e-e8a05921ad93
+content-length: 1
+date: Thu, 22 Jun 2023 00:07:01 GMT
+
+1
+----
+
+Great.  Let's bump it:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/bump -X POST
+HTTP/1.1 204 No Content
+x-request-id: 6e89799a-23df-4acf-b699-f3cb6a0ddc15
+date: Thu, 22 Jun 2023 00:07:16 GMT
+
+----
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 80e83d06-a053-4a62-a0c5-40fa3758eac1
+content-length: 1
+date: Thu, 22 Jun 2023 00:07:18 GMT
+
+2
+----
+
+Great.  Let's bump it a few more times and fetch it a few more:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/bump -X POST
+HTTP/1.1 204 No Content
+x-request-id: 2680cdd9-1011-4305-a01b-41ae0c2a0f8b
+date: Thu, 22 Jun 2023 00:08:01 GMT
+
+$ curl -i http://127.0.0.1:12344/bump -X POST
+HTTP/1.1 204 No Content
+x-request-id: 17d2afbb-29f3-4ccf-ac6d-94ce3fe2ae2e
+date: Thu, 22 Jun 2023 00:08:01 GMT
+
+$ curl -i http://127.0.0.1:12344/bump -X POST
+HTTP/1.1 204 No Content
+x-request-id: b9d35edd-ddd6-4fbe-b205-c4498d222b86
+date: Thu, 22 Jun 2023 00:08:02 GMT
+
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: c57e6b7d-630c-4a62-80b9-c2f4e55484cf
+content-length: 1
+date: Thu, 22 Jun 2023 00:08:04 GMT
+
+5
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 3e557ff6-3cf0-404d-8cb0-e28b04f5cf19
+content-length: 1
+date: Thu, 22 Jun 2023 00:08:04 GMT
+
+5
+----
+
+Now, we can stop our server and start it again:
+
+[source,text]
+----
+^C
+dap@ivanova cancel-repro $ LD_LIBRARY_PATH=/opt/ooce/pgsql-13/lib/amd64 cargo run | looker
+    Finished dev [unoptimized + debuginfo] target(s) in 0.10s
+     Running `target/debug/cancel-repro`
+note: configured to log to "/dev/stdout"
+00:09:20.271Z INFO cancel-repro: setting up dropshot server
+00:09:20.271Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = POST
+    path = /bump
+00:09:20.272Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = GET
+    path = /counter
+00:09:20.272Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = POST
+    path = /reset
+00:09:20.272Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = GET
+    path = /sleep
+00:09:20.272Z INFO cancel-repro: listening
+    local_addr = 127.0.0.1:12344
+00:09:20.272Z DEBG cancel-repro: DTrace USDT probes compiled out, not registering
+    local_addr = 127.0.0.1:12344
+00:09:20.272Z INFO cancel-repro: set up dropshot server
+    local_address = 127.0.0.1:12344
+----
+
+and of course the counter value is still the same, since it was stored in the database:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 1cff3fbd-b4c9-4297-a8c6-615af7b3d75a
+content-length: 1
+date: Thu, 22 Jun 2023 00:10:02 GMT
+
+5
+----
+
+and of course we can bump it:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/bump -X POST
+HTTP/1.1 204 No Content
+x-request-id: 66f00e76-3d28-4317-b41e-2e5b19b7a7cc
+date: Thu, 22 Jun 2023 00:10:08 GMT
+
+
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: fe7adac4-aea7-4c6f-862f-ed4d62b82e36
+content-length: 1
+date: Thu, 22 Jun 2023 00:10:09 GMT
+
+6
+----
+
+There's also a "sleep" endpoint that will just sleep for 5 seconds.  We can hit that and do all the same stuff we did before:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/sleep
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 9a7717f3-78ca-41bc-a4c2-79d5cb20273b
+content-length: 4
+date: Thu, 22 Jun 2023 00:11:28 GMT
+
+"ok"
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 258d5e3c-eec3-4614-91b8-56219ca63776
+content-length: 1
+date: Thu, 22 Jun 2023 00:11:30 GMT
+
+6
+$ curl -i http://127.0.0.1:12344/bump -X POST
+HTTP/1.1 204 No Content
+x-request-id: 32b99dec-6281-471d-8396-b8239fa7ff39
+date: Thu, 22 Jun 2023 00:11:33 GMT
+
+
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 02b1826d-5a83-475c-81c5-f84ee7aa9e12
+content-length: 1
+date: Thu, 22 Jun 2023 00:11:35 GMT
+
+7
+----
+
+== Making things interesting
+
+But what happens if we _cancel_ the sleep endpoint?  All this endpoint does is open a database transaction and then call `tokio::time::sleep` for 5 seconds.  What do you think happens?
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/sleep
+^C
+
+----
+
+There's also logic in the endpoint to notice when it's been cancelled and report it.  So we get this log message:
+
+[source,text]
+----
+00:12:41.786Z ERRO cancel-repro: api_sleep() cancelled
+    local_addr = 127.0.0.1:12344
+    method = GET
+    remote_addr = 127.0.0.1:62550
+    req_id = bba4c1f3-59cb-452e-b324-9a99d65569b4
+    uri = /sleep
+----
+
+Things appear to be working just fine:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 58630d86-e3b7-4a58-93b6-8c88492be733
+content-length: 1
+date: Thu, 22 Jun 2023 00:13:37 GMT
+
+7
+$ curl -i http://127.0.0.1:12344/bump -X POST
+HTTP/1.1 204 No Content
+x-request-id: c39523c0-2cf0-4de5-8cd4-ff40f84a7494
+date: Thu, 22 Jun 2023 00:13:39 GMT
+
+
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: a0bf588f-c64e-407a-9442-de7e6bd73fad
+content-length: 1
+date: Thu, 22 Jun 2023 00:13:40 GMT
+
+8
+$ curl -i http://127.0.0.1:12344/bump -X POST
+HTTP/1.1 204 No Content
+x-request-id: 0ab3363e-5012-49f1-83cd-e3ae9c7d4d4d
+date: Thu, 22 Jun 2023 00:13:42 GMT
+
+
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 539bab87-1564-4378-8127-14b1f8d85d86
+content-length: 1
+date: Thu, 22 Jun 2023 00:13:43 GMT
+
+9
+----
+
+Let's shut down the server and start it up again:
+
+[source,text]
+----
+...
+00:13:43.510Z INFO cancel-repro: request completed
+    local_addr = 127.0.0.1:12344
+    method = GET
+    remote_addr = 127.0.0.1:61645
+    req_id = 539bab87-1564-4378-8127-14b1f8d85d86
+    response_code = 200
+    uri = /counter
+^C
+$ LD_LIBRARY_PATH=/opt/ooce/pgsql-13/lib/amd64 cargo run | looker
+    Finished dev [unoptimized + debuginfo] target(s) in 0.09s
+     Running `target/debug/cancel-repro`
+note: configured to log to "/dev/stdout"
+00:14:21.851Z INFO cancel-repro: setting up dropshot server
+00:14:21.852Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = POST
+    path = /bump
+00:14:21.852Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = GET
+    path = /counter
+00:14:21.852Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = POST
+    path = /reset
+00:14:21.852Z DEBG cancel-repro: registered endpoint
+    local_addr = 127.0.0.1:12344
+    method = GET
+    path = /sleep
+00:14:21.852Z INFO cancel-repro: listening
+    local_addr = 127.0.0.1:12344
+00:14:21.852Z DEBG cancel-repro: DTrace USDT probes compiled out, not registering
+    local_addr = 127.0.0.1:12344
+00:14:21.852Z INFO cancel-repro: set up dropshot server
+    local_address = 127.0.0.1:12344
+...
+----
+
+and the counter will be:
+
+[source,text]
+----
+$ curl -i http://127.0.0.1:12344/counter
+HTTP/1.1 200 OK
+content-type: application/json
+x-request-id: 8dbca33c-fcfc-47fc-a869-65488657a1f9
+content-length: 1
+date: Thu, 22 Jun 2023 00:15:03 GMT
+
+7
+----
+
+**What?!**  The counter was 9 before the restart!
+
+== What happened?
+
+async-bb8-diesel provides a `connection.transaction_async(closure)` function that, just like its https://docs.rs/bb8-diesel/latest/bb8_diesel/struct.DieselConnection.html#method.transaction[synchronous counterpart in bb8-diesel], opens a transaction, executes the closure, and then commits or rolls back the transaction based on the result.  The problem is that `transaction_async` is not cancel-safe.  It has to `await` on your closure.  But if it gets cancelled at that point, then it never commits or rolls back the transaction.  The connection _does_ get put back into the connection pool.
+
+The consequence of this is that when any subsequent operation grabs this database connection, it will unexpectedly be running inside a database transaction.  That transaction will never be committed or rolled back because we've lost track of the fact that we're _in_ a transaction.  What's really rough about this failure mode is that a subsequent operation _can continue successfully executing SQL statements, making updates and fetching data, and everything will appear to be working_.  But it's all provisional on that transaction committing.
+
+Back to the example: when we cancel the "sleep" API call, we triggered this bug.  Every subsequent operation we did to fetch and bump the counter was inside that database transaction and reporting a view of the world in the alternate reality where that transaction completes.  When we shut down and started our server again, we shut down the connection.  (The database would have implicitly rolled back that transaction, but that doesn't even matter.)  Once the server came up again and we fetched the counter value, we were grabbing the live value from the database, not the one visible to that ill-fated transaction.  So the counter appeared to go backwards.
+
+To make this problem more obvious, this program configures a database pool with only one connection so that we always hit the problem.  In a more realistic system, the server would have multiple database connections.  If you fetched the counter value after hitting the bug, you'd get the right value much of the time!  Similarly, most of the "bump" operations would work and actually update the database.  It's just whatever operations got the unlucky connection where (1) updates are completing successfully but being ignored and (2) they will continue read back whatever state has been updated in that connection.
