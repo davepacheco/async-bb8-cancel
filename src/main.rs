@@ -26,32 +26,44 @@ use slog::info;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Configuration
     let db_url = "postgresql://root@127.0.0.1:12345/defaultdb?sslmode=disable";
+    let config_dropshot = dropshot::ConfigDropshot {
+        bind_address: "127.0.0.1:12344".parse().unwrap(),
+        ..Default::default()
+    };
     let config_logging = ConfigLogging::File {
         level: ConfigLoggingLevel::Debug,
         path: "/dev/stdout".into(),
         if_exists: ConfigLoggingIfExists::Append,
     };
-    let config_dropshot = dropshot::ConfigDropshot {
-        bind_address: "127.0.0.1:12344".parse().unwrap(),
-        ..Default::default()
-    };
+
+    // Set up logging.
     let log =
         config_logging.to_logger("cancel-repro").context("creating logger")?;
+
+    // Set up a bb8 connection pool for the database.
     let pool = create_pool(log.clone(), db_url)
         .await
         .context("setting up database pool")?;
+
+    // Set up the Dropshot server.
     info!(&log, "setting up dropshot server");
     let server =
         create_dropshot_server(config_dropshot, log.clone(), pool).await?;
     info!(&log, "set up dropshot server";
         "local_address" => ?server.local_addr());
+
+    // Wait forever serving HTTP requests.
     server.await.map_err(|error| anyhow!("waiting for server: {:#}", error))
 }
 
 ///////////////////////////////
 // Database model and schema
 ///////////////////////////////
+
+// We've got one database table called "counter" with just two integer fields:
+// an id and a count.
 
 #[derive(Queryable, Selectable)]
 #[diesel(table_name = schema::counter)]
@@ -232,6 +244,8 @@ pub async fn create_pool(
     let manager = async_bb8_diesel::ConnectionManager::new(db_url);
     bb8::Builder::new()
         .error_sink(Box::new(error_sink))
+        // Use at most one connection to make sure we reliably get the broken
+        // one after we trigger the bug.
         .max_size(1)
         .build(manager)
         .await
