@@ -167,6 +167,7 @@ async fn api_get_counter(
 ) -> Result<HttpResponseOk<i32>, HttpError> {
     let api_context = rqctx.context();
     let pool = &api_context.pool;
+    // SELECT FROM counter WHERE id = 1
     let value = schema::counter::dsl::counter
         .filter(schema::counter::dsl::id.eq(1))
         .select(Counter::as_select())
@@ -187,6 +188,7 @@ async fn api_bump_counter(
 ) -> Result<HttpResponseUpdatedNoContent, HttpError> {
     let api_context = rqctx.context();
     let pool = &api_context.pool;
+    // UPDATE counter SET count = count + 1 WHERE id = 1
     let nrows = diesel::update(
         schema::counter::dsl::counter.filter(schema::counter::dsl::id.eq(1)),
     )
@@ -207,6 +209,7 @@ async fn api_bump_counter(
 async fn api_sleep(
     rqctx: RequestContext<ExampleContext>,
 ) -> Result<HttpResponseOk<&'static str>, HttpError> {
+    // This guard is used to log a message when this task gets cancelled.
     struct Finished<'a>(&'a slog::Logger, bool);
     impl<'a> Drop for Finished<'a> {
         fn drop(&mut self) {
@@ -219,6 +222,7 @@ async fn api_sleep(
     let mut finished = Finished(&rqctx.log, false);
     let api_context = rqctx.context();
     let pool = &api_context.pool;
+    // Enter a transaction, do an async operation, and then return.
     let result: Result<_, anyhow::Error> = pool
         .transaction_async(|_conn| async {
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
